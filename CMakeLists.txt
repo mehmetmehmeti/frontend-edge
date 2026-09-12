@@ -10,7 +10,7 @@ find_package(BZip2 REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(Fontconfig REQUIRED)
 find_package(PNG REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Quick Qml)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Quick Qml QuickControls2)
 
 qt_standard_project_setup()
 
@@ -31,10 +31,24 @@ target_link_libraries(appDiplomaFrontendEdge
         Qt6::Gui
         Qt6::Quick
         Qt6::Qml
+        Qt6::QuickControls2
         Fontconfig::Fontconfig
         freetype
         EXPAT::EXPAT
 )
+
+get_target_property(EXPAT_ARCHIVE EXPAT::EXPAT IMPORTED_LOCATION_RELEASE)
+if(NOT EXPAT_ARCHIVE)
+    get_target_property(EXPAT_ARCHIVE EXPAT::EXPAT IMPORTED_LOCATION)
+endif()
+if(EXPAT_ARCHIVE)
+    target_link_libraries(appDiplomaFrontendEdge
+        PRIVATE
+            -Wl,--whole-archive
+            ${EXPAT_ARCHIVE}
+            -Wl,--no-whole-archive
+    )
+endif()
 
 include(GNUInstallDirs)
 install(TARGETS appDiplomaFrontendEdge
