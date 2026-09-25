@@ -182,8 +182,7 @@ ApplicationWindow {
         }, { silent: silent })
         root.request("/streams", "GET", null, function(response) {
             root.streams = response.streams || []
-            if ((!root.selectedStreamId || !root.findById(root.streams, root.selectedStreamId)) && root.streams.length > 0)
-                root.selectedStreamId = root.streams[0].id || ""
+            root.selectedStreamId = root.preferredStreamId(root.streams, root.selectedStreamId)
         }, { silent: silent })
         root.request("/videos", "GET", null, function(response) {
             root.videos = response.videos || []
@@ -317,6 +316,23 @@ ApplicationWindow {
                 return item
         }
         return null
+    }
+
+    function preferredStreamId(list, currentId) {
+        const current = root.findById(list, currentId)
+        if (current && String(current.status || "").toLowerCase() === "live")
+            return current.id || ""
+
+        for (let i = 0; list && i < list.length; ++i) {
+            const item = list[i]
+            if (String(item.status || "").toLowerCase() === "live")
+                return item.id || ""
+        }
+
+        if (current)
+            return current.id || ""
+
+        return list && list.length > 0 ? (list[0].id || "") : ""
     }
 
     function countByStatus(list, status) {
