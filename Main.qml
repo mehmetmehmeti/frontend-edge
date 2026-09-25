@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtCore
+import DiplomaFrontendEdge
 
 ApplicationWindow {
     id: root
@@ -671,11 +672,20 @@ ApplicationWindow {
                         Layout.fillHeight: true
                         radius: 8
                         color: root.colors.dark
+                        clip: true
+
+                        VideoPreviewItem {
+                            id: localPreview
+                            anchors.fill: parent
+                            visible: root.streamEdgeStreaming
+                            opacity: root.streamEdgeStreaming ? 1 : 0
+                        }
 
                         ColumnLayout {
                             anchors.centerIn: parent
                             width: Math.min(parent.width - 48, 520)
                             spacing: 10
+                            visible: !root.streamEdgeStreaming
                             Label {
                                 text: root.streamEdgeStreaming ? "Streaming active" : "Preview standby"
                                 color: "#dbe6df"
@@ -692,6 +702,27 @@ ApplicationWindow {
                                 wrapMode: Text.WordWrap
                                 horizontalAlignment: Text.AlignHCenter
                                 Layout.fillWidth: true
+                            }
+                        }
+
+                        Rectangle {
+                            visible: root.streamEdgeStreaming
+                            anchors.left: parent.left
+                            anchors.bottom: parent.bottom
+                            anchors.margins: 12
+                            radius: 8
+                            color: "#cc101613"
+                            border.color: "#334c5a50"
+                            implicitWidth: previewLabel.implicitWidth + 20
+                            implicitHeight: previewLabel.implicitHeight + 12
+
+                            Label {
+                                id: previewLabel
+                                anchors.centerIn: parent
+                                text: localPreview.liveFrameActive ? "Live frame bridge" : "Preview surface"
+                                color: "#dbe6df"
+                                font.pixelSize: 12
+                                font.bold: true
                             }
                         }
                     }

@@ -16,6 +16,10 @@ qt_standard_project_setup()
 
 qt_add_executable(appDiplomaFrontendEdge
     main.cpp
+    core/streaming/StreamingBridgeRegistry.cpp
+    core/streaming/StreamingBridgeRegistry.h
+    core/streaming/VideoPreviewItem.cpp
+    core/streaming/VideoPreviewItem.h
 )
 
 qt_add_qml_module(appDiplomaFrontendEdge
@@ -35,6 +39,11 @@ target_link_libraries(appDiplomaFrontendEdge
         Fontconfig::Fontconfig
         freetype
         EXPAT::EXPAT
+)
+
+target_include_directories(appDiplomaFrontendEdge
+    PRIVATE
+        core/streaming
 )
 
 get_target_property(EXPAT_ARCHIVE EXPAT::EXPAT IMPORTED_LOCATION_RELEASE)
