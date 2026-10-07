@@ -18,6 +18,7 @@ struct VideoPreviewDiagnostics
 class VideoPreviewItem : public QQuickFramebufferObject
 {
     Q_OBJECT
+    Q_PROPERTY(QString sourcePipeline READ sourcePipeline WRITE setSourcePipeline NOTIFY sourcePipelineChanged)
     Q_PROPERTY(qulonglong publishedFrameCount READ publishedFrameCount NOTIFY diagnosticsChanged)
     Q_PROPERTY(qulonglong acquiredFrameCount READ acquiredFrameCount NOTIFY diagnosticsChanged)
     Q_PROPERTY(qulonglong renderedFrameCount READ renderedFrameCount NOTIFY diagnosticsChanged)
@@ -31,6 +32,8 @@ public:
     explicit VideoPreviewItem(QQuickItem* parent = nullptr);
 
     Renderer* createRenderer() const override;
+    QString sourcePipeline() const { return sourcePipeline_; }
+    void setSourcePipeline(const QString& value);
 
     qulonglong publishedFrameCount() const;
     qulonglong acquiredFrameCount() const;
@@ -44,8 +47,10 @@ public:
     void setDiagnostics(const VideoPreviewDiagnostics& diagnostics);
 
 signals:
+    void sourcePipelineChanged();
     void diagnosticsChanged();
 
 private:
+    QString sourcePipeline_;
     VideoPreviewDiagnostics diagnostics_;
 };

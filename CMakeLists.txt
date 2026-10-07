@@ -10,6 +10,8 @@ find_package(BZip2 REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(Fontconfig REQUIRED)
 find_package(PNG REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET gstreamer-app-1.0 gstreamer-video-1.0)
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Quick Qml QuickControls2)
 
 qt_standard_project_setup()
@@ -36,6 +38,7 @@ target_link_libraries(appDiplomaFrontendEdge
         Qt6::Quick
         Qt6::Qml
         Qt6::QuickControls2
+        PkgConfig::GSTREAMER
         Fontconfig::Fontconfig
         freetype
         EXPAT::EXPAT

@@ -9,8 +9,11 @@
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLTexture>
+#include <QOpenGLPixelTransferOptions>
 #include <QMetaObject>
 #include <QSize>
+#include <gst/app/gstappsink.h>
+#include <gst/video/video.h>
 
 #ifdef FRONTEND_HAS_CUDA_OPENGL_INTEROP
 #include <cuda_gl_interop.h>
@@ -155,7 +158,21 @@ public:
 
     ~VideoPreviewRenderer() override
     {
+        closeSharedPreview();
         releaseCudaTextureResource();
+    }
+
+    void synchronize(QQuickFramebufferObject* item) override
+    {
+        const auto source = static_cast<VideoPreviewItem*>(item)->sourcePipeline();
+        if (source != sourcePipeline_)
+        {
+            closeSharedPreview();
+            sourcePipeline_ = source;
+            lastLiveFrameRenderedMs_ = 0;
+            hasRenderedLiveFrame_ = false;
+            nextPreviewRetryMs_ = 0;
+        }
     }
 
     QOpenGLFramebufferObject* createFramebufferObject(const QSize& size) override
@@ -203,7 +220,8 @@ public:
                               GL_FALSE,
                               4 * sizeof(GLfloat),
                               vertices_.data() + 2);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        if (hasRenderedLiveFrame_)
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         glDisableVertexAttribArray(0);
         glDisableVertexAttribArray(1);
 
@@ -333,7 +351,80 @@ private:
             return;
 #endif
 
-        updateTestPatternTexture();
+        tryUpdateFromSharedMemory();
+    }
+
+    void closeSharedPreview()
+    {
+        if (previewPipeline_)
+            gst_element_set_state(previewPipeline_, GST_STATE_NULL);
+        if (previewSink_)
+            gst_object_unref(previewSink_);
+        if (previewPipeline_)
+            gst_object_unref(previewPipeline_);
+        previewSink_ = nullptr;
+        previewPipeline_ = nullptr;
+    }
+
+    void tryUpdateFromSharedMemory()
+    {
+        if (sourcePipeline_.isEmpty())
+            return;
+        const auto now = frameTimer_.elapsed();
+        if (!previewPipeline_)
+        {
+            if (now < nextPreviewRetryMs_)
+                return;
+            nextPreviewRetryMs_ = now + 1000;
+            gst_init(nullptr, nullptr);
+            GError* error = nullptr;
+            previewPipeline_ = gst_parse_launch(sourcePipeline_.toUtf8().constData(), &error);
+            if (error)
+            {
+                qWarning() << "Local preview:" << error->message;
+                g_error_free(error);
+                closeSharedPreview();
+                return;
+            }
+            previewSink_ = gst_bin_get_by_name(GST_BIN(previewPipeline_), "preview");
+            if (!previewSink_ || gst_element_set_state(previewPipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
+            {
+                closeSharedPreview();
+                return;
+            }
+        }
+        auto* bus = gst_element_get_bus(previewPipeline_);
+        auto* message = gst_bus_pop_filtered(bus, static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+        gst_object_unref(bus);
+        if (message)
+        {
+            gst_message_unref(message);
+            closeSharedPreview();
+            return;
+        }
+        auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(previewSink_), 0);
+        if (!sample)
+            return;
+        GstVideoInfo info;
+        GstVideoFrame frame;
+        if (gst_video_info_from_caps(&info, gst_sample_get_caps(sample)) &&
+            gst_video_frame_map(&frame, &info, gst_sample_get_buffer(sample), GST_MAP_READ))
+        {
+            ensureTexture(info.width, info.height, StreamingTextureFormat::RGBA);
+            texture_->bind();
+            QOpenGLPixelTransferOptions options;
+            options.setRowLength(GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0) / 4);
+            texture_->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8,
+                              GST_VIDEO_FRAME_PLANE_DATA(&frame, 0), &options);
+            texture_->release();
+            gst_video_frame_unmap(&frame);
+            ++renderedFrameCount_;
+            lastLiveFrameRenderedMs_ = now;
+            hasRenderedLiveFrame_ = true;
+        }
+        else
+            ++invalidFrameCount_;
+        gst_sample_unref(sample);
     }
 
     VideoPreviewDiagnostics makeDiagnosticsSnapshot() const
@@ -543,6 +634,10 @@ private:
     }
 
     VideoPreviewItem* item_{nullptr};
+    QString sourcePipeline_;
+    GstElement* previewPipeline_{nullptr};
+    GstElement* previewSink_{nullptr};
+    qint64 nextPreviewRetryMs_{0};
     bool initialized_{false};
     QElapsedTimer frameTimer_;
     std::unique_ptr<QOpenGLShaderProgram> shaderProgram_;
@@ -570,6 +665,15 @@ private:
 VideoPreviewItem::VideoPreviewItem(QQuickItem* parent)
     : QQuickFramebufferObject(parent)
 {
+}
+
+void VideoPreviewItem::setSourcePipeline(const QString& value)
+{
+    if (sourcePipeline_ == value)
+        return;
+    sourcePipeline_ = value;
+    emit sourcePipelineChanged();
+    update();
 }
 
 QQuickFramebufferObject::Renderer* VideoPreviewItem::createRenderer() const
