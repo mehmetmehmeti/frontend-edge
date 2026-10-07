@@ -8,28 +8,30 @@ ApplicationWindow {
     id: root
     width: 1360
     height: 820
-    minimumWidth: 1060
+    minimumWidth: 960
     minimumHeight: 680
     visible: true
-    title: "Diploma Edge Console"
+    title: "Capture Console | Edge"
+    font.family: "Arial"
+    font.pixelSize: 13
     color: root.colors.background
 
     readonly property var colors: appPalette
 
     QtObject {
         id: appPalette
-        readonly property color background: "#f3f5f2"
+        readonly property color background: "#f6f7f9"
         readonly property color surface: "#ffffff"
-        readonly property color surfaceAlt: "#eef2ed"
-        readonly property color text: "#17211b"
-        readonly property color muted: "#657166"
-        readonly property color border: "#d8ded4"
-        readonly property color accent: "#0f766e"
-        readonly property color accentSoft: "#e5f3f0"
+        readonly property color surfaceAlt: "#eff1f5"
+        readonly property color text: "#20242c"
+        readonly property color muted: "#717783"
+        readonly property color border: "#e1e4e9"
+        readonly property color accent: "#245de3"
+        readonly property color accentSoft: "#eef3ff"
         readonly property color blue: "#2563eb"
         readonly property color warning: "#a16207"
         readonly property color danger: "#b42318"
-        readonly property color dark: "#101613"
+        readonly property color dark: "#15171b"
     }
 
     Settings {
@@ -52,13 +54,15 @@ ApplicationWindow {
     property string email: settings.email
     property string password: ""
     property string fullName: ""
+    property int workspaceIndex: 0
     property string mode: "login"
     property string statusText: "Ready"
     property string statusKind: "info"
     property string selectedStreamId: ""
     property string selectedDeviceId: defaultDeviceId
     property string streamTitle: "Edge local stream"
-    property bool busy: false
+    property int activeRequests: 0
+    readonly property bool busy: activeRequests > 0
     property bool refreshing: false
     property bool syncConnected: false
     property bool streamEdgeAvailable: false
@@ -66,6 +70,7 @@ ApplicationWindow {
     property bool streamEdgeRecording: false
     property string streamEdgeStatus: "unknown"
     property string streamEdgeMessage: ""
+    property string previewPipeline: ""
     property string lastRefreshText: "Not refreshed yet"
     property int requestCounter: 0
 
@@ -85,20 +90,24 @@ ApplicationWindow {
         const xhr = new XMLHttpRequest()
         const requestId = ++root.requestCounter
         const silent = options && options.silent
+        let settled = false
+        function settle() {
+            if (!settled && !silent) root.activeRequests = Math.max(0, root.activeRequests - 1)
+            settled = true
+        }
         xhr.open(method || "GET", root.apiBaseUrl.replace(/\/+$/, "") + path)
         xhr.setRequestHeader("Content-Type", "application/json")
         if (root.token && root.token.length > 0)
             xhr.setRequestHeader("Authorization", "Bearer " + root.token)
 
         if (!silent)
-            root.busy = true
+            root.activeRequests += 1
 
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE)
                 return
 
-            if (!silent && requestId === root.requestCounter)
-                root.busy = false
+            settle()
 
             let payload = ({})
             try {
@@ -119,8 +128,7 @@ ApplicationWindow {
                 callback(payload)
         }
         xhr.onerror = function() {
-            if (!silent)
-                root.busy = false
+            settle()
             root.setStatus("Could not reach edge backend at " + root.apiBaseUrl, "error")
         }
         xhr.send(body ? JSON.stringify(body) : undefined)
@@ -229,6 +237,13 @@ ApplicationWindow {
         })
     }
 
+    function hasPendingCommand() {
+        return root.commands.some(function(command) {
+            return command.device_id === root.selectedDeviceId &&
+                ["pending", "claimed", "processing"].indexOf(command.status) >= 0
+        })
+    }
+
     function stopCurrentStream() {
         if (!root.selectedStreamId) {
             root.setStatus("Select a stream first", "error")
@@ -274,6 +289,8 @@ ApplicationWindow {
                 return
             if (xhr.status < 200 || xhr.status >= 300) {
                 root.streamEdgeAvailable = false
+                root.streamEdgeStreaming = false
+                root.previewPipeline = ""
                 root.streamEdgeStatus = "offline"
                 root.streamEdgeMessage = "stream-edge unavailable"
                 return
@@ -288,10 +305,20 @@ ApplicationWindow {
             root.streamEdgeStatus = String(payload.status || "ok")
             root.streamEdgeStreaming = payload.streaming === true
             root.streamEdgeRecording = payload.recording === true
+            const bridge = payload.publisher ? payload.publisher.framebridge_export : null
+            root.previewPipeline = payload.streaming && bridge && bridge.started && bridge.width
+                ? 'shmsrc socket-path="' + bridge.socket_path + '" is-live=true do-timestamp=true ! '
+                  + 'video/x-raw,format=' + bridge.gst_format + ',width=' + bridge.width
+                  + ',height=' + bridge.height + ',framerate=' + bridge.frame_rate_num + '/' + bridge.frame_rate_den
+                  + ' ! queue max-size-buffers=1 leaky=downstream ! videoconvert ! video/x-raw,format=RGBA'
+                  + ' ! appsink name=preview max-buffers=1 drop=true sync=false'
+                : ""
             root.streamEdgeMessage = String(payload.lastError || payload.sourceSignalError || payload.message || "")
         }
         xhr.onerror = function() {
             root.streamEdgeAvailable = false
+            root.streamEdgeStreaming = false
+            root.previewPipeline = ""
             root.streamEdgeStatus = "offline"
             root.streamEdgeMessage = "stream-edge unavailable"
         }
@@ -348,13 +375,11 @@ ApplicationWindow {
     function statusColor(status) {
         const normalized = String(status || "").toLowerCase()
         if (normalized === "live" || normalized === "streaming" || normalized === "online" || normalized === "completed" || normalized === "active")
-            return root.colors.accent
-        if (normalized === "starting" || normalized === "pending" || normalized === "claimed" || normalized === "processing" || normalized === "uploading" || normalized === "recording")
-            return root.colors.blue
-        if (normalized === "error" || normalized === "failed" || normalized === "offline")
-            return root.colors.danger
-        if (normalized === "stopping" || normalized === "ended")
+            return "#23815c"
+        if (normalized === "starting" || normalized === "pending" || normalized === "claimed" || normalized === "processing" || normalized === "uploading" || normalized === "stopping")
             return root.colors.warning
+        if (normalized === "error" || normalized === "failed" || normalized === "recording")
+            return root.colors.danger
         return root.colors.muted
     }
 
@@ -391,65 +416,77 @@ ApplicationWindow {
 
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 18
-        spacing: 14
-
-        RowLayout {
+        spacing: 0
+        Rectangle {
             Layout.fillWidth: true
-            spacing: 12
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 2
-                Label {
-                    text: "Diploma Edge Console"
-                    font.pixelSize: 26
-                    font.bold: true
-                    color: root.colors.text
+            Layout.preferredHeight: 82
+            color: root.colors.surface
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 28
+                anchors.rightMargin: 28
+                spacing: 18
+                Rectangle {
+                    Layout.preferredWidth: 36; Layout.minimumWidth: 36; Layout.maximumWidth: 36
+                    height: 36; radius: 6; color: root.colors.accentSoft
+                    Label { anchors.centerIn: parent; text: "E"; font.bold: true; font.pixelSize: 18; color: root.colors.accent }
                 }
-                Label {
-                    text: root.token
-                          ? ((root.currentUser.full_name || "Local operator") + " · " + root.selectedDeviceId)
-                          : "Local device control, command sync, and recording operations"
-                    color: root.colors.muted
-                    elide: Text.ElideRight
+                ColumnLayout {
                     Layout.fillWidth: true
+                    spacing: 3
+                    Label { text: "Capture Console"; font.pixelSize: 18; font.bold: true; color: root.colors.text; Layout.fillWidth: true }
+                    Label { text: "Edge workspace"; font.pixelSize: 12; color: root.colors.muted; Layout.fillWidth: true }
+                }
+                StatusPill {
+                    label: root.streamEdgeAvailable ? "Camera connected" : "Camera offline"
+                    dotColor: root.streamEdgeAvailable ? "#23815c" : root.colors.danger
+                }
+                Label {
+                    text: root.currentUser.full_name || ""
+                    color: root.colors.muted
+                    Layout.maximumWidth: 180
+                    elide: Text.ElideRight
+                }
+                ToolButton {
+                    text: "↻"; font.pixelSize: 23
+                    Layout.preferredWidth: 34; Layout.maximumWidth: 34
+                    enabled: root.token.length > 0 && !root.busy
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Refresh data"
+                    Accessible.name: "Refresh data"
+                    onClicked: root.refreshAll(false)
+                }
+                ToolButton {
+                    text: "↪"; font.pixelSize: 23
+                    Layout.preferredWidth: 34; Layout.maximumWidth: 34
+                    visible: root.token.length > 0
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Sign out"
+                    Accessible.name: "Sign out"
+                    onClicked: root.logout(true)
                 }
             }
-
-            StatusPill {
-                label: root.streamEdgeAvailable ? (root.streamEdgeStreaming ? "Stream-edge live" : "Stream-edge ready") : "Stream-edge offline"
-                dotColor: root.streamEdgeAvailable ? root.colors.accent : root.colors.danger
-            }
-            StatusPill {
-                label: root.syncConnected ? "Backend synced" : "Backend waiting"
-                dotColor: root.syncConnected ? root.colors.accent : root.colors.warning
-            }
-            ToolButton {
-                text: "Refresh"
-                enabled: root.token.length > 0 && !root.busy
-                onClicked: root.refreshAll(false)
-            }
-            ToolButton {
-                text: "Logout"
-                visible: root.token.length > 0
-                onClicked: root.logout(true)
-            }
+            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: root.colors.border }
         }
-
         Loader {
             Layout.fillWidth: true
             Layout.fillHeight: true
             sourceComponent: root.token.length > 0 ? dashboardComponent : authComponent
+        }
+        Rectangle {
+            Layout.fillWidth: true; Layout.preferredHeight: 34; color: root.colors.background
+            RowLayout {
+                anchors.fill: parent; anchors.leftMargin: 28; anchors.rightMargin: 28
+                Label { text: "Diploma / Edge"; color: root.colors.muted; font.pixelSize: 11; Layout.fillWidth: true }
+                Label { text: root.selectedDeviceId; color: root.colors.muted; font.pixelSize: 11 }
+            }
         }
     }
 
     Component {
         id: authComponent
         Rectangle {
-            color: root.colors.surface
-            radius: 8
-            border.color: root.colors.border
+            color: root.colors.background
 
             ColumnLayout {
                 width: Math.min(parent.width - 48, 460)
@@ -464,7 +501,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                 }
                 Label {
-                    text: "Use local credentials stored on the edge backend."
+                    text: "Edge workspace"
                     color: root.colors.muted
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
@@ -473,14 +510,16 @@ ApplicationWindow {
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 0
-                    Button {
+                    ActionButton {
+                        kind: root.mode === "login" ? "primary" : "secondary"
                         text: "Login"
                         checkable: true
                         checked: root.mode === "login"
                         Layout.fillWidth: true
                         onClicked: root.mode = "login"
                     }
-                    Button {
+                    ActionButton {
+                        kind: root.mode === "register" ? "primary" : "secondary"
                         text: "Register"
                         checkable: true
                         checked: root.mode === "register"
@@ -489,20 +528,20 @@ ApplicationWindow {
                     }
                 }
 
-                TextField {
+                InputField {
                     visible: root.mode === "register"
                     placeholderText: "Full name"
                     text: root.fullName
                     onTextChanged: root.fullName = text
                     Layout.fillWidth: true
                 }
-                TextField {
+                InputField {
                     placeholderText: "Email"
                     text: root.email
                     onTextChanged: root.email = text
                     Layout.fillWidth: true
                 }
-                TextField {
+                InputField {
                     placeholderText: "Password"
                     echoMode: TextInput.Password
                     text: root.password
@@ -510,7 +549,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     Keys.onReturnPressed: root.loginOrRegister()
                 }
-                TextField {
+                InputField {
                     placeholderText: "Backend URL"
                     text: root.apiBaseUrl
                     onEditingFinished: {
@@ -519,7 +558,8 @@ ApplicationWindow {
                     }
                     Layout.fillWidth: true
                 }
-                Button {
+                ActionButton {
+                    kind: "primary"
                     text: root.busy ? "Working..." : (root.mode === "register" ? "Create account" : "Enter console")
                     enabled: !root.busy
                     Layout.fillWidth: true
@@ -536,302 +576,241 @@ ApplicationWindow {
 
     Component {
         id: dashboardComponent
-        GridLayout {
-            columns: 12
-            columnSpacing: 14
-            rowSpacing: 14
-
-            Panel {
-                title: "Control"
-                Layout.columnSpan: 3
-                Layout.rowSpan: 2
-                Layout.fillHeight: true
-                Layout.minimumWidth: 300
-
-                ColumnLayout {
-                    anchors.fill: parent
-                    anchors.margins: 16
-                    anchors.topMargin: 52
-                    spacing: 10
-
-                    LabelText { text: "Device id" }
-                    TextField {
-                        text: root.selectedDeviceId
-                        onEditingFinished: {
-                            root.selectedDeviceId = text
-                            settings.deviceId = text
-                        }
-                        Layout.fillWidth: true
-                    }
-                    LabelText { text: "Stream title" }
-                    TextField {
-                        text: root.streamTitle
-                        onTextChanged: root.streamTitle = text
-                        Layout.fillWidth: true
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Button {
-                            text: "Register"
-                            Layout.fillWidth: true
-                            enabled: !root.busy
-                            onClicked: root.registerCurrentDevice()
-                        }
-                        Button {
-                            text: "Start"
-                            Layout.fillWidth: true
-                            enabled: !root.busy
-                            onClicked: root.startCurrentStream()
+        ColumnLayout {
+            spacing: 0
+            Rectangle {
+                Layout.fillWidth: true; Layout.preferredHeight: 52; color: root.colors.surface
+                RowLayout {
+                    anchors.left: parent.left; anchors.leftMargin: 28; height: parent.height; spacing: 26
+                    Repeater {
+                        model: ["Live", "Recordings", "Activity", "Devices"]
+                        delegate: Button {
+                            required property int index
+                            required property string modelData
+                            text: modelData
+                            implicitHeight: 52
+                            leftPadding: 0; rightPadding: 0
+                            contentItem: Label { text: parent.text; color: root.workspaceIndex === index ? root.colors.accent : root.colors.muted; font.bold: root.workspaceIndex === index; verticalAlignment: Text.AlignVCenter }
+                            background: Item {
+                                Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 2; color: root.colors.accent; visible: root.workspaceIndex === index }
+                            }
+                            onClicked: root.workspaceIndex = index
                         }
                     }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Button {
-                            text: "Stop"
-                            Layout.fillWidth: true
-                            enabled: !root.busy && root.selectedStreamId.length > 0
-                            onClicked: root.stopCurrentStream()
-                        }
-                        Button {
-                            text: "Record"
-                            Layout.fillWidth: true
-                            enabled: !root.busy && root.selectedStreamId.length > 0
-                            onClicked: root.startCurrentRecording()
-                        }
-                    }
-                    Button {
-                        text: "Stop Recording"
-                        Layout.fillWidth: true
-                        enabled: !root.busy && root.selectedStreamId.length > 0
-                        onClicked: root.stopCurrentRecording()
-                    }
-
-                    StatusBanner {
-                        text: root.statusText
-                        kind: root.statusKind
-                        Layout.fillWidth: true
-                    }
-
-                    Rectangle {
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 1
-                        color: root.colors.border
-                    }
-
-                    MetricRow { label: "Live streams"; value: String(root.liveStreamCount) }
-                    MetricRow { label: "Recordings"; value: String(root.recordingCount) }
-                    MetricRow { label: "Commands"; value: String(root.commands.length) }
-                    MetricRow { label: "Last refresh"; value: root.lastRefreshText }
                 }
+                Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: root.colors.border; z: -1 }
             }
-
-            Panel {
-                title: "Local Stream Preview"
-                Layout.columnSpan: 6
-                Layout.rowSpan: 2
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-
-                ColumnLayout {
-                    anchors.fill: parent
-                    anchors.margins: 16
-                    anchors.topMargin: 52
-                    spacing: 12
-
+            ColumnLayout {
+                Layout.fillWidth: true; Layout.fillHeight: true
+                Layout.margins: 28
+                spacing: 20
+                RowLayout {
+                    Layout.fillWidth: true
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 6
+                        Label { text: root.workspaceIndex === 0 ? "MONITOR" : "WORKSPACE"; font.pixelSize: 10; color: root.colors.muted; font.bold: true }
+                        Label { text: ["Live stream", "Recordings", "Activity", "Devices"][root.workspaceIndex]; font.pixelSize: 25; color: root.colors.text; font.bold: true }
+                    }
+                    StatusPill {
+                        visible: root.workspaceIndex === 0
+                        label: root.streamEdgeRecording ? "Recording" : root.streamEdgeStreaming ? "Live" : "Idle"
+                        dotColor: root.streamEdgeRecording ? root.colors.danger : root.streamEdgeStreaming ? "#23815c" : root.colors.muted
+                    }
+                }
+                StackLayout {
+                    Layout.fillWidth: true; Layout.fillHeight: true
+                    currentIndex: root.workspaceIndex
                     RowLayout {
-                        Layout.fillWidth: true
+                        spacing: 28
                         ColumnLayout {
-                            Layout.fillWidth: true
-                            spacing: 2
-                            Label {
-                                text: root.selectedStream ? (root.selectedStream.title || root.selectedStream.id) : "No stream selected"
-                                color: root.colors.text
-                                font.pixelSize: 18
-                                font.bold: true
-                                elide: Text.ElideRight
+                            Layout.fillWidth: true; Layout.fillHeight: true; spacing: 12
+                            Rectangle {
+                                Layout.fillWidth: true; Layout.fillHeight: true
+                                Layout.minimumHeight: 240
+                                radius: 5; color: root.colors.dark; clip: true
+                                VideoPreviewItem {
+                                    id: localPreview
+                                    objectName: "cameraPreview"
+                                    sourcePipeline: root.previewPipeline
+                                    anchors.fill: parent
+                                    visible: root.streamEdgeStreaming
+                                }
+                                ColumnLayout {
+                                    anchors.centerIn: parent
+                                    width: Math.min(parent.width - 40, 440)
+                                    spacing: 10
+                                    visible: !root.streamEdgeStreaming || !localPreview.liveFrameActive
+                                    Label {
+                                        text: root.streamEdgeStreaming ? "Connecting camera" : "Stream offline"
+                                        color: "#e6e8eb"; font.pixelSize: 19; horizontalAlignment: Text.AlignHCenter; Layout.fillWidth: true
+                                    }
+                                    Label {
+                                        text: root.streamEdgeAvailable ? "Camera standing by" : "Camera service unavailable"
+                                        color: "#9198a4"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; Layout.fillWidth: true; wrapMode: Text.WordWrap
+                                    }
+                                }
+                                Label {
+                                    visible: root.streamEdgeStreaming && localPreview.liveFrameActive
+                                    anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 14
+                                    text: "●  LIVE"; color: "#b9e8cf"; font.pixelSize: 11
+                                    padding: 7
+                                    background: Rectangle { color: "#dd22262f"; radius: 4 }
+                                }
+                            }
+                            RowLayout {
                                 Layout.fillWidth: true
+                                ColumnLayout {
+                                    Layout.fillWidth: true; spacing: 4
+                                    Label {
+                                        text: root.streamEdgeStreaming && root.selectedStream ? root.selectedStream.title : root.streamTitle
+                                        color: root.colors.text; font.bold: true; Layout.fillWidth: true; elide: Text.ElideRight
+                                    }
+                                    Label { text: root.selectedDeviceId; color: root.colors.muted; font.pixelSize: 11 }
+                                }
+                                Label { text: "Local preview"; color: root.colors.muted; font.pixelSize: 11 }
                             }
-                            Label {
-                                text: root.selectedStream
-                                      ? ((root.selectedStream.device_id || "") + " · " + (root.selectedStream.status || "unknown"))
-                                      : "Start or select a stream to inspect edge state."
-                                color: root.colors.muted
-                                elide: Text.ElideRight
+                            Rectangle { Layout.fillWidth: true; height: 1; color: root.colors.border }
+                            RowLayout {
                                 Layout.fillWidth: true
+                                Label { text: "Latest activity"; color: root.colors.text; font.bold: true; Layout.fillWidth: true }
+                                Button { text: "View all"; flat: true; onClicked: root.workspaceIndex = 2 }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true; Layout.preferredHeight: 24
+                                Label {
+                                    text: root.latestCommand.command ? (root.latestCommand.command + " " + root.latestCommand.target) : "No activity yet"
+                                    color: root.colors.muted; Layout.fillWidth: true; elide: Text.ElideRight
+                                }
+                                Label { text: root.latestCommand.status || ""; color: root.statusColor(root.latestCommand.status); font.pixelSize: 12 }
                             }
                         }
-                        StatusPill {
-                            label: root.streamEdgeStatus
-                            dotColor: root.statusColor(root.streamEdgeStatus)
-                        }
-                    }
-
-                    Rectangle {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        radius: 8
-                        color: root.colors.dark
-                        clip: true
-
-                        VideoPreviewItem {
-                            id: localPreview
-                            anchors.fill: parent
-                            visible: root.streamEdgeStreaming
-                            opacity: root.streamEdgeStreaming ? 1 : 0
-                        }
-
-                        ColumnLayout {
-                            anchors.centerIn: parent
-                            width: Math.min(parent.width - 48, 520)
-                            spacing: 10
-                            visible: !root.streamEdgeStreaming
-                            Label {
-                                text: root.streamEdgeStreaming ? "Streaming active" : "Preview standby"
-                                color: "#dbe6df"
-                                font.pixelSize: 24
-                                font.bold: true
-                                horizontalAlignment: Text.AlignHCenter
+                        Rectangle { Layout.fillHeight: true; width: 1; color: root.colors.border }
+                        ScrollView {
+                            id: captureScroll
+                            Layout.preferredWidth: 252; Layout.minimumWidth: 252; Layout.maximumWidth: 252; Layout.fillHeight: true
+                            contentWidth: availableWidth
+                            clip: true
+                            ColumnLayout {
+                            width: captureScroll.availableWidth
+                            spacing: 14
+                            Label { text: "Capture"; font.bold: true; color: root.colors.text }
+                            LabelText { text: "Edge device" }
+                            Label { text: root.selectedDeviceId; color: root.colors.text; elide: Text.ElideRight; Layout.fillWidth: true }
+                            LabelText { text: "Stream name" }
+                            InputField {
+                                Layout.fillWidth: true; implicitHeight: 38
+                                text: root.streamEdgeStreaming && root.selectedStream ? root.selectedStream.title : root.streamTitle
+                                enabled: !root.streamEdgeStreaming && !root.busy
+                                onEditingFinished: root.streamTitle = text
+                                background: Rectangle { color: "white"; radius: 5; border.color: root.colors.border }
+                            }
+                            ActionButton {
                                 Layout.fillWidth: true
+                                text: root.hasPendingCommand() ? "Command pending" : root.streamEdgeStreaming ? "■  Stop stream" : "▶  Start stream"
+                                kind: root.streamEdgeStreaming ? "danger" : "primary"
+                                enabled: !root.busy && !root.hasPendingCommand() && root.streamEdgeAvailable
+                                onClicked: root.streamEdgeStreaming ? root.stopCurrentStream() : root.startCurrentStream()
                             }
-                            Label {
-                                text: root.streamEdgeAvailable
-                                      ? (root.streamEdgeMessage.length > 0 ? root.streamEdgeMessage : "Qt video surface can attach to stream-edge frame bridge in the next slice.")
-                                      : "Start stream-edge to enable local preview and stream health."
-                                color: "#b9c6bf"
-                                wrapMode: Text.WordWrap
-                                horizontalAlignment: Text.AlignHCenter
+                            Rectangle { Layout.fillWidth: true; height: 1; color: root.colors.border; Layout.topMargin: 6; Layout.bottomMargin: 6 }
+                            RowLayout {
                                 Layout.fillWidth: true
+                                Label { text: "Recording"; font.bold: true; color: root.colors.text; Layout.fillWidth: true }
+                                Label { text: root.streamEdgeRecording ? "Recording" : "Off"; color: root.streamEdgeRecording ? root.colors.danger : root.colors.muted; font.pixelSize: 11 }
                             }
-                        }
-
-                        Rectangle {
-                            visible: root.streamEdgeStreaming
-                            anchors.left: parent.left
-                            anchors.bottom: parent.bottom
-                            anchors.margins: 12
-                            radius: 8
-                            color: "#cc101613"
-                            border.color: "#334c5a50"
-                            implicitWidth: previewLabel.implicitWidth + 20
-                            implicitHeight: previewLabel.implicitHeight + 12
-
-                            Label {
-                                id: previewLabel
-                                anchors.centerIn: parent
-                                text: localPreview.liveFrameActive ? "Live frame bridge" : "Preview surface"
-                                color: "#dbe6df"
-                                font.pixelSize: 12
-                                font.bold: true
+                            ActionButton {
+                                Layout.fillWidth: true
+                                text: root.streamEdgeRecording ? "■  Stop recording" : "●  Start recording"
+                                kind: root.streamEdgeRecording ? "danger" : "secondary"
+                                enabled: !root.busy && !root.hasPendingCommand() && root.streamEdgeStreaming && root.selectedStreamId.length > 0 && root.selectedStream && root.selectedStream.user_id === root.currentUser.id
+                                onClicked: root.streamEdgeRecording ? root.stopCurrentRecording() : root.startCurrentRecording()
+                            }
+                            Item { Layout.preferredHeight: 4 }
+                            MetricRow { label: "Backend"; value: root.syncConnected ? "Connected" : "Unavailable" }
+                            MetricRow { label: "Last update"; value: root.lastRefreshText }
+                            StatusBanner {
+                                Layout.fillWidth: true
+                                visible: root.statusText !== "Ready" && root.statusText.length > 0
+                                text: root.statusText; kind: root.statusKind
+                            }
                             }
                         }
                     }
-                }
-            }
-
-            Panel {
-                title: "Command Queue"
-                Layout.columnSpan: 3
-                Layout.rowSpan: 2
-                Layout.fillHeight: true
-                Layout.minimumWidth: 300
-
-                ListView {
-                    anchors.fill: parent
-                    anchors.margins: 16
-                    anchors.topMargin: 52
-                    spacing: 8
-                    clip: true
-                    model: root.commands.slice(0, 12)
-                    delegate: ListRow {
-                        titleText: (modelData.command || "") + " " + (modelData.target || "")
-                        metaText: (modelData.device_id || "") + " · " + (modelData.status || "")
-                        statusText: modelData.status || ""
+                    Item {
+                        ListView {
+                            anchors.fill: parent; clip: true; spacing: 0; model: root.videos
+                            ScrollBar.vertical: ScrollBar {}
+                            delegate: ListRow {
+                                titleText: modelData.title || "Untitled recording"
+                                metaText: (modelData.status || "") + " · " + (modelData.duration_seconds || 0) + " sec · " + new Date(modelData.created_at).toLocaleString()
+                                statusText: modelData.status || ""
+                            }
+                            Label { anchors.centerIn: parent; visible: root.videos.length === 0; text: "No recordings yet"; color: root.colors.muted }
+                        }
                     }
-                }
-            }
-
-            Panel {
-                title: "Streams"
-                Layout.columnSpan: 5
-                Layout.fillWidth: true
-                Layout.preferredHeight: 260
-
-                ColumnLayout {
-                    anchors.fill: parent
-                    anchors.margins: 16
-                    anchors.topMargin: 52
-                    spacing: 8
-
-                    ComboBox {
-                        Layout.fillWidth: true
-                        textRole: "label"
-                        valueRole: "value"
-                        model: root.streams.map(function(item) {
-                            return { label: (item.title || item.id) + " · " + item.status, value: item.id }
-                        })
-                        onActivated: root.selectedStreamId = currentValue
+                    Item {
+                        ListView {
+                            anchors.fill: parent; clip: true; spacing: 0; model: root.commands
+                            ScrollBar.vertical: ScrollBar {}
+                            delegate: ListRow {
+                                titleText: (modelData.command || "") + " " + (modelData.target || "")
+                                metaText: (modelData.status || "") + " · " + (modelData.error_message || new Date(modelData.created_at).toLocaleString())
+                                statusText: modelData.status || ""
+                            }
+                            Label { anchors.centerIn: parent; visible: root.commands.length === 0; text: "No commands yet"; color: root.colors.muted }
+                        }
                     }
-                    ListView {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        clip: true
-                        spacing: 8
-                        model: root.streams
-                        delegate: ListRow {
-                            titleText: modelData.title || modelData.id
-                            metaText: (modelData.status || "") + " · media " + (modelData.mediasoup_stream_id || modelData.id || "")
-                            statusText: modelData.status || ""
-                            selected: root.selectedStreamId === modelData.id
-                            onClicked: root.selectedStreamId = modelData.id || ""
+                    ColumnLayout {
+                        spacing: 22
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 12
+                            InputField {
+                                Layout.preferredWidth: 280; implicitHeight: 40
+                                text: root.selectedDeviceId
+                                placeholderText: "Device ID"
+                                onEditingFinished: { root.selectedDeviceId = text; settings.deviceId = text }
+                            }
+                            ActionButton { text: "Register device"; enabled: !root.busy; onClicked: root.registerCurrentDevice() }
+                            Item { Layout.fillWidth: true }
+                        }
+                        ListView {
+                            Layout.fillWidth: true; Layout.fillHeight: true; clip: true; model: root.devices
+                            ScrollBar.vertical: ScrollBar {}
+                            delegate: ListRow {
+                                titleText: modelData.name || modelData.id
+                                metaText: (modelData.status || "") + " · Stream " + (modelData.streaming ? "live" : "off") + " · Recording " + (modelData.recording ? "on" : "off")
+                                statusText: modelData.status || ""
+                                selected: root.selectedDeviceId === modelData.id
+                                onClicked: { root.selectedDeviceId = modelData.id; settings.deviceId = modelData.id }
+                            }
                         }
                     }
                 }
             }
+        }
+    }
 
-            Panel {
-                title: "Devices"
-                Layout.columnSpan: 3
-                Layout.fillWidth: true
-                Layout.preferredHeight: 260
+    component InputField: TextField {
+        implicitHeight: 40
+        leftPadding: 12
+        rightPadding: 12
+        color: root.colors.text
+        background: Rectangle { color: "white"; radius: 5; border.color: parent.activeFocus ? root.colors.accent : root.colors.border }
+    }
 
-                ListView {
-                    anchors.fill: parent
-                    anchors.margins: 16
-                    anchors.topMargin: 52
-                    spacing: 8
-                    clip: true
-                    model: root.devices
-                    delegate: ListRow {
-                        titleText: modelData.name || modelData.id
-                        metaText: (modelData.status || "") + " · stream " + (modelData.streaming ? "on" : "off") + " · rec " + (modelData.recording ? "on" : "off")
-                        statusText: modelData.status || ""
-                        selected: root.selectedDeviceId === modelData.id
-                        onClicked: root.selectedDeviceId = modelData.id || root.selectedDeviceId
-                    }
-                }
-            }
-
-            Panel {
-                title: "Videos"
-                Layout.columnSpan: 4
-                Layout.fillWidth: true
-                Layout.preferredHeight: 260
-
-                ListView {
-                    anchors.fill: parent
-                    anchors.margins: 16
-                    anchors.topMargin: 52
-                    spacing: 8
-                    clip: true
-                    model: root.videos
-                    delegate: ListRow {
-                        titleText: modelData.title || modelData.id
-                        metaText: (modelData.status || "") + " · " + (modelData.edge_local_path || modelData.playback_url || "waiting for file")
-                        statusText: modelData.status || ""
-                    }
-                }
-            }
+    component ActionButton: Button {
+        property string kind: "secondary"
+        implicitHeight: 40
+        leftPadding: 12; rightPadding: 12
+        opacity: enabled ? 1 : 0.45
+        contentItem: Label {
+            text: parent.text; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+            font.pixelSize: 12; font.bold: true
+            color: parent.kind === "primary" ? "white" : parent.kind === "danger" ? root.colors.danger : root.colors.text
+        }
+        background: Rectangle {
+            radius: 5
+            color: parent.kind === "primary" ? (parent.hovered ? "#194cc7" : root.colors.accent) : parent.kind === "danger" ? "#fff4f5" : (parent.hovered ? root.colors.surfaceAlt : "white")
+            border.color: parent.activeFocus ? root.colors.accent : parent.kind === "primary" ? root.colors.accent : root.colors.border
         }
     }
 
@@ -859,13 +838,13 @@ ApplicationWindow {
     }
 
     component StatusPill: Rectangle {
+        Layout.fillWidth: false
         property string label: ""
         property color dotColor: root.colors.muted
         implicitHeight: 34
         implicitWidth: labelText.implicitWidth + 38
-        radius: 17
-        color: root.colors.surface
-        border.color: root.colors.border
+        radius: 0
+        color: "transparent"
 
         RowLayout {
             anchors.fill: parent
@@ -894,7 +873,7 @@ ApplicationWindow {
         implicitHeight: Math.max(42, bannerLabel.implicitHeight + 18)
         radius: 8
         color: kind === "error" ? "#fff1f0" : kind === "success" ? root.colors.accentSoft : root.colors.surfaceAlt
-        border.color: kind === "error" ? "#ffc9c4" : kind === "success" ? "#bfddd8" : root.colors.border
+        border.color: kind === "error" ? "#ffc9c4" : kind === "success" ? "#c9d8f5" : root.colors.border
 
         Label {
             id: bannerLabel
@@ -932,9 +911,9 @@ ApplicationWindow {
 
         width: ListView.view ? ListView.view.width : 260
         height: 64
-        radius: 8
-        color: selected ? root.colors.accentSoft : "#fbfcfa"
-        border.color: selected ? "#bfddd8" : root.colors.border
+        radius: 0
+        color: selected ? root.colors.accentSoft : "transparent"
+        Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: root.colors.border }
 
         MouseArea {
             anchors.fill: parent
