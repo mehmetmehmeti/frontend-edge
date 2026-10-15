@@ -40,6 +40,7 @@ ApplicationWindow {
         property string apiBaseUrl: "http://127.0.0.1:3002"
         property string deviceId: "edge-dev-001"
         property string email: ""
+        property string webApiBaseUrl: "http://127.0.0.1:3000"
     }
 
     property string apiBaseUrl: settings.apiBaseUrl
@@ -73,6 +74,10 @@ ApplicationWindow {
     property string previewPipeline: ""
     property string lastRefreshText: "Not refreshed yet"
     property int requestCounter: 0
+    property var selectedRecording: ({})
+    property string recordingMessage: ""
+    property string fullscreenTarget: ""
+    property int videoWindowVisibility: Window.Windowed
 
     readonly property var selectedStream: root.findById(root.streams, root.selectedStreamId)
     readonly property var selectedDevice: root.findById(root.devices, root.selectedDeviceId)
@@ -95,7 +100,8 @@ ApplicationWindow {
             if (!settled && !silent) root.activeRequests = Math.max(0, root.activeRequests - 1)
             settled = true
         }
-        xhr.open(method || "GET", root.apiBaseUrl.replace(/\/+$/, "") + path)
+        const baseUrl = options && options.baseUrl ? options.baseUrl : root.apiBaseUrl
+        xhr.open(method || "GET", baseUrl.replace(/\/+$/, "") + path)
         xhr.setRequestHeader("Content-Type", "application/json")
         if (root.token && root.token.length > 0)
             xhr.setRequestHeader("Authorization", "Bearer " + root.token)
@@ -119,6 +125,7 @@ ApplicationWindow {
             if (xhr.status < 200 || xhr.status >= 300) {
                 const message = payload.message || payload.error || ("Request failed: " + xhr.status)
                 root.setStatus(message, "error")
+                if (options && options.onError) options.onError(message)
                 if (xhr.status === 401)
                     root.logout(false)
                 return
@@ -129,7 +136,9 @@ ApplicationWindow {
         }
         xhr.onerror = function() {
             settle()
-            root.setStatus("Could not reach edge backend at " + root.apiBaseUrl, "error")
+            const message = "Could not reach backend at " + baseUrl
+            root.setStatus(message, "error")
+            if (options && options.onError) options.onError(message)
         }
         xhr.send(body ? JSON.stringify(body) : undefined)
     }
@@ -159,6 +168,8 @@ ApplicationWindow {
     }
 
     function logout(showMessage) {
+        recordingDialog.close()
+        root.exitVideoFullscreen()
         root.token = ""
         settings.authToken = ""
         root.currentUser = ({})
@@ -390,6 +401,146 @@ ApplicationWindow {
         if (isNaN(parsed))
             return String(value)
         return Qt.formatDateTime(new Date(parsed), "yyyy-MM-dd hh:mm:ss")
+    }
+
+    function openRecording(video) {
+        if (!video || ["completed", "uploading"].indexOf(video.status) < 0) {
+            root.setStatus("This recording is not ready for playback", "error")
+            return
+        }
+        root.selectedRecording = video
+        root.recordingMessage = "Opening recording"
+        recordingPreview.sourcePipeline = ""
+        recordingDialog.open()
+        if (recordingPreview.openRecording(String(video.edge_local_path || ""))) {
+            root.recordingMessage = ""
+            return
+        }
+        root.request("/videos/" + encodeURIComponent(video.id) + "/playback", "POST", {}, function(response) {
+            if (!recordingDialog.opened || root.selectedRecording.id !== video.id) return
+            root.recordingMessage = recordingPreview.openRecording(response.url || "")
+                ? "" : "Recording file is unavailable"
+        }, {
+            baseUrl: settings.webApiBaseUrl,
+            onError: function(message) { root.recordingMessage = message }
+        })
+    }
+
+    function toggleVideoFullscreen(target) {
+        if (root.fullscreenTarget === target) {
+            root.exitVideoFullscreen()
+        } else {
+            root.videoWindowVisibility = root.visibility
+            root.fullscreenTarget = target
+            root.showFullScreen()
+        }
+    }
+
+    function exitVideoFullscreen() {
+        if (!root.fullscreenTarget) return
+        root.fullscreenTarget = ""
+        if (root.videoWindowVisibility === Window.Maximized) root.showMaximized()
+        else root.showNormal()
+    }
+
+    function playbackTime(milliseconds) {
+        const seconds = Math.floor(Math.max(0, milliseconds) / 1000)
+        return Math.floor(seconds / 60) + ":" + (seconds % 60 < 10 ? "0" : "") + seconds % 60
+    }
+
+    Rectangle {
+        id: fullscreenHost
+        objectName: "videoFullscreenHost"
+        parent: Overlay.overlay
+        anchors.fill: parent
+        z: 10000
+        visible: root.fullscreenTarget.length > 0
+        color: root.colors.dark
+        Shortcut { sequence: "Escape"; enabled: root.fullscreenTarget.length > 0; onActivated: root.exitVideoFullscreen() }
+    }
+
+    Dialog {
+        id: recordingDialog
+        objectName: "recordingDialog"
+        anchors.centerIn: parent
+        width: Math.min(root.width - 64, 1040)
+        height: Math.min(root.height - 64, 700)
+        modal: true
+        closePolicy: root.fullscreenTarget ? Popup.NoAutoClose : Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        title: root.selectedRecording.title || "Recording"
+        standardButtons: Dialog.Close
+        onClosed: {
+            if (root.fullscreenTarget === "recording") root.exitVideoFullscreen()
+            recordingPreview.sourcePipeline = ""
+            root.selectedRecording = ({})
+        }
+        contentItem: Item {
+          Rectangle {
+            id: recordingSurface
+            anchors.fill: parent
+            color: root.colors.dark
+            clip: true
+            states: State {
+                name: "fullscreen"
+                when: root.fullscreenTarget === "recording"
+                ParentChange {
+                    target: recordingSurface
+                    parent: fullscreenHost
+                }
+            }
+            VideoPreviewItem {
+                id: recordingPreview
+                objectName: "recordingPreview"
+                anchors.fill: parent
+                anchors.bottomMargin: 56
+            }
+            Label {
+                anchors.centerIn: recordingPreview
+                width: parent.width - 48
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                color: "white"
+                visible: recordingPreview.playbackError.length > 0 || !recordingPreview.liveFrameActive
+                text: recordingPreview.playbackError || root.recordingMessage || "Loading recording"
+            }
+            RowLayout {
+                anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
+                anchors.margins: 12
+                spacing: 12
+                VideoToolButton {
+                    objectName: "recordingFullscreenButton"
+                    text: "⛶"
+                    tooltip: root.fullscreenTarget === "recording" ? "Exit fullscreen" : "Fullscreen"
+                    onClicked: root.toggleVideoFullscreen("recording")
+                }
+                VideoToolButton {
+                    objectName: "recordingPlayButton"
+                    text: recordingPreview.paused || recordingPreview.playbackFinished ? "▶" : "Ⅱ"
+                    tooltip: recordingPreview.paused || recordingPreview.playbackFinished ? "Play" : "Pause"
+                    enabled: recordingPreview.durationMs > 0 && !recordingPreview.playbackError
+                    onClicked: {
+                        if (recordingPreview.playbackFinished) {
+                            recordingPreview.seek(0)
+                            recordingPreview.paused = false
+                        } else recordingPreview.paused = !recordingPreview.paused
+                    }
+                }
+                Slider {
+                    objectName: "recordingSeekSlider"
+                    Layout.fillWidth: true
+                    from: 0; to: Math.max(1, recordingPreview.durationMs)
+                    value: recordingPreview.positionMs
+                    enabled: recordingPreview.durationMs > 0
+                    onMoved: recordingPreview.seek(value)
+                }
+                Label {
+                    text: root.playbackTime(recordingPreview.positionMs) + " / " + root.playbackTime(recordingPreview.durationMs)
+                    color: "#e6e8eb"
+                    font.pixelSize: 12
+                }
+            }
+          }
+        }
     }
 
     Timer {
@@ -624,10 +775,21 @@ ApplicationWindow {
                         spacing: 28
                         ColumnLayout {
                             Layout.fillWidth: true; Layout.fillHeight: true; spacing: 12
-                            Rectangle {
+                            Item {
                                 Layout.fillWidth: true; Layout.fillHeight: true
                                 Layout.minimumHeight: 240
+                              Rectangle {
+                                id: liveSurface
+                                anchors.fill: parent
                                 radius: 5; color: root.colors.dark; clip: true
+                                states: State {
+                                    name: "fullscreen"
+                                    when: root.fullscreenTarget === "live"
+                                    ParentChange {
+                                        target: liveSurface
+                                        parent: fullscreenHost
+                                    }
+                                }
                                 VideoPreviewItem {
                                     id: localPreview
                                     objectName: "cameraPreview"
@@ -651,11 +813,20 @@ ApplicationWindow {
                                 }
                                 Label {
                                     visible: root.streamEdgeStreaming && localPreview.liveFrameActive
-                                    anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 14
+                                    anchors.left: parent.left; anchors.leftMargin: 60
+                                    anchors.bottom: parent.bottom; anchors.bottomMargin: 16
                                     text: "●  LIVE"; color: "#b9e8cf"; font.pixelSize: 11
                                     padding: 7
                                     background: Rectangle { color: "#dd22262f"; radius: 4 }
                                 }
+                                VideoToolButton {
+                                    objectName: "liveFullscreenButton"
+                                    anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 12
+                                    text: "⛶"
+                                    tooltip: root.fullscreenTarget === "live" ? "Exit fullscreen" : "Fullscreen"
+                                    onClicked: root.toggleVideoFullscreen("live")
+                                }
+                              }
                             }
                             RowLayout {
                                 Layout.fillWidth: true
@@ -743,6 +914,8 @@ ApplicationWindow {
                                 titleText: modelData.title || "Untitled recording"
                                 metaText: (modelData.status || "") + " · " + (modelData.duration_seconds || 0) + " sec · " + new Date(modelData.created_at).toLocaleString()
                                 statusText: modelData.status || ""
+                                actionIcon: ["completed", "uploading"].indexOf(modelData.status) >= 0 ? "▶" : ""
+                                onClicked: root.openRecording(modelData)
                             }
                             Label { anchors.centerIn: parent; visible: root.videos.length === 0; text: "No recordings yet"; color: root.colors.muted }
                         }
@@ -795,6 +968,30 @@ ApplicationWindow {
         rightPadding: 12
         color: root.colors.text
         background: Rectangle { color: "white"; radius: 5; border.color: parent.activeFocus ? root.colors.accent : root.colors.border }
+    }
+
+    component VideoToolButton: Button {
+        property string tooltip: ""
+        width: 36; height: 36
+        implicitWidth: 36; implicitHeight: 36
+        padding: 0
+        hoverEnabled: true
+        ToolTip.visible: hovered
+        ToolTip.text: tooltip
+        ToolTip.delay: 400
+        Accessible.name: tooltip
+        contentItem: Label {
+            text: parent.text
+            color: "white"
+            font.pixelSize: 22
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            color: parent.hovered ? "#454a54" : "#dd22262f"
+            border.color: "#454a54"
+            radius: 4
+        }
     }
 
     component ActionButton: Button {
@@ -907,6 +1104,7 @@ ApplicationWindow {
         property string metaText: ""
         property string statusText: ""
         property bool selected: false
+        property string actionIcon: ""
         signal clicked()
 
         width: ListView.view ? ListView.view.width : 260
@@ -917,6 +1115,7 @@ ApplicationWindow {
 
         MouseArea {
             anchors.fill: parent
+            cursorShape: parent.actionIcon.length > 0 ? Qt.PointingHandCursor : Qt.ArrowCursor
             onClicked: parent.clicked()
         }
 
@@ -947,6 +1146,12 @@ ApplicationWindow {
                     elide: Text.ElideRight
                     Layout.fillWidth: true
                 }
+            }
+            Label {
+                text: actionIcon
+                visible: actionIcon.length > 0
+                color: root.colors.accent
+                font.pixelSize: 18
             }
         }
     }

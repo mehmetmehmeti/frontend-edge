@@ -12,6 +12,10 @@
 #include <QOpenGLPixelTransferOptions>
 #include <QMetaObject>
 #include <QSize>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
+#include <QUrl>
 #include <gst/app/gstappsink.h>
 #include <gst/video/video.h>
 
@@ -74,7 +78,9 @@ bool diagnosticsEqual(const VideoPreviewDiagnostics& lhs,
            lhs.missingFrameCount == rhs.missingFrameCount &&
            lhs.invalidFrameCount == rhs.invalidFrameCount &&
            lhs.interopFailureCount == rhs.interopFailureCount &&
-           lhs.liveFrameActive == rhs.liveFrameActive;
+           lhs.liveFrameActive == rhs.liveFrameActive &&
+           lhs.positionMs == rhs.positionMs && lhs.durationMs == rhs.durationMs &&
+           lhs.playbackFinished == rhs.playbackFinished && lhs.playbackError == rhs.playbackError;
 }
 
 std::vector<unsigned char> buildTestPattern(int frameNumber)
@@ -164,15 +170,33 @@ public:
 
     void synchronize(QQuickFramebufferObject* item) override
     {
-        const auto source = static_cast<VideoPreviewItem*>(item)->sourcePipeline();
-        if (source != sourcePipeline_)
+        const auto* preview = static_cast<VideoPreviewItem*>(item);
+        const auto source = preview->sourcePipeline();
+        if (source != sourcePipeline_ || sourceSerial_ != preview->sourceSerial())
         {
             closeSharedPreview();
             sourcePipeline_ = source;
+            sourceSerial_ = preview->sourceSerial();
             lastLiveFrameRenderedMs_ = 0;
             hasRenderedLiveFrame_ = false;
             nextPreviewRetryMs_ = 0;
+            playbackMode_ = source.startsWith(QStringLiteral("uridecodebin "));
+            playbackFinished_ = false;
+            playbackError_.clear();
+            positionMs_ = durationMs_ = 0;
+            appliedSeekSerial_ = requestedSeekSerial_ = preview->seekSerial();
+            seekSequence_ = GST_SEQNUM_INVALID;
+            prerollNeeded_ = true;
         }
+        if (paused_ != preview->paused())
+        {
+            paused_ = preview->paused();
+            prerollNeeded_ = true;
+            if (previewPipeline_)
+                gst_element_set_state(previewPipeline_, paused_ ? GST_STATE_PAUSED : GST_STATE_PLAYING);
+        }
+        requestedSeekSerial_ = preview->seekSerial();
+        seekPositionMs_ = preview->seekPositionMs();
     }
 
     QOpenGLFramebufferObject* createFramebufferObject(const QSize& size) override
@@ -344,10 +368,10 @@ private:
             return;
 
 #ifdef FRONTEND_HAS_STREAMING_FRAME_BRIDGE
-        if (tryUpdateFromFrameBridge())
+        if (!playbackMode_ && tryUpdateFromFrameBridge())
             return;
 
-        if (hasRenderedLiveFrame_)
+        if (!playbackMode_ && hasRenderedLiveFrame_)
             return;
 #endif
 
@@ -368,7 +392,7 @@ private:
 
     void tryUpdateFromSharedMemory()
     {
-        if (sourcePipeline_.isEmpty())
+        if (sourcePipeline_.isEmpty() || (playbackMode_ && !playbackError_.isEmpty()))
             return;
         const auto now = frameTimer_.elapsed();
         if (!previewPipeline_)
@@ -382,15 +406,41 @@ private:
             if (error)
             {
                 qWarning() << "Local preview:" << error->message;
+                if (playbackMode_)
+                    playbackError_ = QString::fromUtf8(error->message);
                 g_error_free(error);
                 closeSharedPreview();
                 return;
             }
             previewSink_ = gst_bin_get_by_name(GST_BIN(previewPipeline_), "preview");
-            if (!previewSink_ || gst_element_set_state(previewPipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
+            if (!previewSink_ || gst_element_set_state(previewPipeline_, paused_ ? GST_STATE_PAUSED : GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
             {
+                if (playbackMode_)
+                    playbackError_ = QStringLiteral("Could not start the recording decoder");
                 closeSharedPreview();
                 return;
+            }
+        }
+        if (playbackMode_)
+        {
+            gint64 duration = 0, position = 0;
+            if (gst_element_query_duration(previewPipeline_, GST_FORMAT_TIME, &duration))
+                durationMs_ = duration / GST_MSECOND;
+            if (gst_element_query_position(previewPipeline_, GST_FORMAT_TIME, &position))
+                positionMs_ = position / GST_MSECOND;
+            if (requestedSeekSerial_ != appliedSeekSerial_)
+            {
+                auto* event = gst_event_new_seek(1.0, GST_FORMAT_TIME,
+                    static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
+                    GST_SEEK_TYPE_SET, seekPositionMs_ * GST_MSECOND, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+                const auto sequence = gst_event_get_seqnum(event);
+                if (gst_element_send_event(previewPipeline_, event))
+                {
+                    appliedSeekSerial_ = requestedSeekSerial_;
+                    seekSequence_ = sequence;
+                    playbackFinished_ = false;
+                    prerollNeeded_ = true;
+                }
             }
         }
         auto* bus = gst_element_get_bus(previewPipeline_);
@@ -398,13 +448,34 @@ private:
         gst_object_unref(bus);
         if (message)
         {
+            if (playbackMode_ && GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS)
+            {
+                // A delayed EOS from the previous segment must not stop a seek or replay.
+                if (seekSequence_ == GST_SEQNUM_INVALID || gst_message_get_seqnum(message) == seekSequence_)
+                    playbackFinished_ = true;
+            }
+            else if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR)
+            {
+                GError* error = nullptr;
+                gchar* debug = nullptr;
+                gst_message_parse_error(message, &error, &debug);
+                if (playbackMode_)
+                    playbackError_ = QString::fromUtf8(error->message);
+                qWarning() << "Video decoder:" << error->message;
+                g_clear_error(&error);
+                g_free(debug);
+            }
             gst_message_unref(message);
-            closeSharedPreview();
+            if (!playbackMode_ || !playbackError_.isEmpty())
+                closeSharedPreview();
             return;
         }
-        auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(previewSink_), 0);
+        auto* sample = paused_ && prerollNeeded_
+            ? gst_app_sink_try_pull_preroll(GST_APP_SINK(previewSink_), 0)
+            : gst_app_sink_try_pull_sample(GST_APP_SINK(previewSink_), 0);
         if (!sample)
             return;
+        prerollNeeded_ = false;
         GstVideoInfo info;
         GstVideoFrame frame;
         if (gst_video_info_from_caps(&info, gst_sample_get_caps(sample)) &&
@@ -449,9 +520,12 @@ private:
         diagnostics.invalidFrameCount = static_cast<qulonglong>(invalidFrameCount_);
         diagnostics.interopFailureCount = static_cast<qulonglong>(interopFailureCount_);
         const qint64 nowMs = frameTimer_.elapsed();
-        diagnostics.liveFrameActive = lastLiveFrameRenderedMs_ > 0 &&
-                                      nowMs - lastLiveFrameRenderedMs_ <=
-                                          kLiveFrameActiveWindowMs;
+        diagnostics.liveFrameActive = playbackMode_ ? hasRenderedLiveFrame_ :
+            lastLiveFrameRenderedMs_ > 0 && nowMs - lastLiveFrameRenderedMs_ <= kLiveFrameActiveWindowMs;
+        diagnostics.positionMs = positionMs_;
+        diagnostics.durationMs = durationMs_;
+        diagnostics.playbackFinished = playbackFinished_;
+        diagnostics.playbackError = playbackError_;
 
         return diagnostics;
     }
@@ -635,6 +709,15 @@ private:
 
     VideoPreviewItem* item_{nullptr};
     QString sourcePipeline_;
+    qulonglong sourceSerial_{0};
+    bool playbackMode_{false};
+    bool paused_{false};
+    bool prerollNeeded_{true};
+    bool playbackFinished_{false};
+    QString playbackError_;
+    qint64 positionMs_{0}, durationMs_{0}, seekPositionMs_{0};
+    qulonglong requestedSeekSerial_{0}, appliedSeekSerial_{0};
+    guint32 seekSequence_{GST_SEQNUM_INVALID};
     GstElement* previewPipeline_{nullptr};
     GstElement* previewSink_{nullptr};
     qint64 nextPreviewRetryMs_{0};
@@ -672,7 +755,52 @@ void VideoPreviewItem::setSourcePipeline(const QString& value)
     if (sourcePipeline_ == value)
         return;
     sourcePipeline_ = value;
+    ++sourceSerial_;
     emit sourcePipelineChanged();
+    update();
+}
+
+void VideoPreviewItem::setPaused(bool value)
+{
+    if (paused_ == value)
+        return;
+    paused_ = value;
+    emit pausedChanged();
+    update();
+}
+
+bool VideoPreviewItem::openRecording(const QString& pathOrUrl)
+{
+    if (pathOrUrl.isEmpty())
+        return false;
+    QUrl url = QUrl::fromUserInput(pathOrUrl);
+    if (url.isLocalFile())
+    {
+        QFileInfo file(url.toLocalFile());
+        if (!file.isFile())
+        {
+            // Locate recordings saved before the repository directory was renamed.
+            file.setFile(QDir(QCoreApplication::applicationDirPath()).filePath(
+                "../../stream-edge/streaming-service/recordings/" + file.fileName()));
+        }
+        if (!file.isFile() || file.size() == 0)
+            return false;
+        url = QUrl::fromLocalFile(file.absoluteFilePath());
+    }
+    else if (url.scheme() != "http" && url.scheme() != "https")
+        return false;
+    setSourcePipeline(QString());
+    setPaused(false);
+    setSourcePipeline(QStringLiteral("uridecodebin uri=\"%1\" ! videoconvert ! video/x-raw,format=RGBA "
+                                    "! appsink name=preview max-buffers=2 drop=true sync=true")
+                          .arg(QString::fromLatin1(url.toEncoded())));
+    return true;
+}
+
+void VideoPreviewItem::seek(qint64 positionMs)
+{
+    seekPositionMs_ = std::max(qint64(0), positionMs);
+    ++seekSerial_;
     update();
 }
 
